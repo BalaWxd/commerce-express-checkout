@@ -1,0 +1,209 @@
+<?php
+/**
+ * The module is commerce_express_checkout initially downloaded from community,
+ * then we get this module as base and start developing based on it.
+ *
+ * Express checkout which skip the add to cart pharse and directly create a order.
+ */
+
+module_load_include('inc', 'commerce_express_checkout', 'commerce_express_checkout.field');
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_express_checkout_menu() {
+
+  $items['admin/commerce/products/express-checkout-links'] = array(
+      'title' => 'Generate Product Express Checkout Buttons',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('commerce_express_checkout_generate_links'),
+      'access arguments' => array('access administration pages'),
+      'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['commerce-express-checkout/%/%'] = array(
+      'title' => 'Express Checkout',
+      'page callback' => 'commerce_express_checkout_create_order',
+      'page arguments' => array(1, 2),
+      'access arguments' => array('access express checkout'),
+      'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+function commerce_express_checkout_permission() {
+  return array(
+    'access express checkout' => array(
+      'title' => t('Access express checkout'),
+      'description' => t('Allow to use express checkout'),
+    ),
+  );
+}
+
+function commerce_express_checkout_commerce_checkout_pane_info_alter(&$panes) {
+  if (arg(0) == 'checkout' && is_numeric(arg(1))) {
+    $order = commerce_order_load(arg(1));
+
+    if (array_key_exists('type', $order->data) && $order->data['type'] == 'commerce_express_checkout_order'){
+      $panes['checkout_review']['page'] = 'disabled';
+      $panes['commerce_payment']['page'] = 'checkout';
+    }
+  }
+}
+
+/**
+ * Create an order programmatically and skip cart.
+ */
+function commerce_express_checkout_create_order($product_id, $token) {
+  $is_request_valid = drupal_hmac_base64($product_id, drupal_get_private_key().drupal_get_hash_salt()) == $token;
+
+  if ($is_request_valid) {
+    global $user;
+
+    // The entity which we are going to referencing it with the order and
+    // line_item_type in case if the other modules need this info can use entity
+    // api to refer them.
+
+    $parameters = array(
+      'entity_id' => isset($_GET['entity_id']) ? check_plain($_GET['entity_id']) : '',
+      'entity_type' => isset($_GET['entity_type']) ? check_plain($_GET['entity_type']) : '',
+      'bundle' => isset($_GET['bundle']) ? check_plain($_GET['bundle']) : '',
+      'quantity' => isset($_GET['quantity']) ? floatval($_GET['quantity']) : 1,
+    );
+
+    $line_item_type = isset($_GET['line_item_type']) ? check_plain($_GET['line_item_type']) : 'product';
+
+    // Load the commerce product.
+    $product = commerce_product_load($product_id);
+
+    // Create an order
+    $order = ($user->uid) ? commerce_order_new($user->uid, 'checkout_checkout') : commerce_cart_order_new();
+    commerce_order_save($order);
+
+    $line_item = commerce_express_checkout_line_item_create($product,
+      $parameters['quantity'],
+      $order->order_id,
+      $parameters,
+      $line_item_type);
+
+    // Add the line_item to the order
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+    $order_wrapper->commerce_line_items[] = $line_item;
+
+    // Flag to be tracked in hook_commerce_checkout_pane_info_alter,
+    // to tell this is a express checkout result order.
+    $order->data['type'] = 'commerce_express_checkout_order';
+    $order->data += $parameters;
+
+    // Save the order
+    commerce_order_save($order);
+
+    drupal_goto('checkout/' . $order->order_id . '/checkout');
+  }
+}
+
+function commerce_express_checkout_line_item_create($product, $quantity, $order_id, $data = array(), $type = 'product') {
+
+  // Create a line_item
+  $line_item = commerce_product_line_item_new($product,
+    $quantity,
+    $order_id,
+    $data,
+    $type
+  );
+
+  // Provides other module a way to alter the line_item
+  drupal_alter('express_checkout_out_line_item', $line_item);
+
+  // Allow modules to prepare this as necessary. This hook is defined by the
+  // Product Pricing module.
+  drupal_alter('commerce_product_calculate_sell_price_line_item', $line_item);
+
+  // Process the unit price through Rules so it reflects the user's actual
+  // purchase price.
+  rules_invoke_event('commerce_product_calculate_sell_price', $line_item);
+
+  // Save the line_item.
+  commerce_line_item_save($line_item);
+
+  return $line_item;
+}
+
+
+
+
+function commerce_express_checkout_generate_links($form, &$form_state) {
+
+  $products = db_query("SELECT * FROM {commerce_product} WHERE status=1");
+
+  $products_array = array();
+
+  foreach ($products as $product) {
+    $products_array[$product->product_id] = $product->title;
+  }
+
+  $form['products'] = array(
+      '#type' => 'select',
+      '#title' => t('Select Product'),
+      '#options' => $products_array,
+      '#required' => TRUE,
+      '#default_value' => array_key_exists("commerce_express_checkout_selected", $_SESSION) ? $_SESSION['commerce_express_checkout_selected'] : NULL,
+      '#description' => t('Select a Product and click Generate Code, then copy the code from below'),
+  );
+
+  $form['submit'] = array(
+      '#type' => 'submit',
+      '#value' => t('Generate Code'),
+  );
+
+  $form['link'] = array(
+      '#markup' => '<div style="width: 80%; border: 2px solid #CCCCCC; padding: 20px;"><p>' . (array_key_exists("commerce_express_checkout_link", $_SESSION) ? $_SESSION["commerce_express_checkout_link"] : "") . '</p>',
+  );
+
+  if (array_key_exists("commerce_express_checkout_link", $_SESSION)){
+    unset($_SESSION["commerce_express_checkout_selected"]);
+    unset($_SESSION["commerce_express_checkout_link"]);
+  }
+
+  return $form;
+}
+
+function commerce_express_checkout_generate_links_submit($form, &$form_state) {
+  $_SESSION["commerce_express_checkout_selected"] = $form_state['values']['products'];
+  $_SESSION["commerce_express_checkout_link"] = commerce_express_checkout_generate_checkout_button_code($form_state['values']['products']);
+}
+
+/**
+ * Generate express checkout link button.
+ */
+function commerce_express_checkout_generate_checkout_button($product_id, $text, $attributes = array(), $options) {
+  $token = drupal_hmac_base64($product_id, drupal_get_private_key() . drupal_get_hash_salt());
+  $path = "commerce-express-checkout/".$product_id.'/' . $token;
+
+  if (isset($attributes['class'])) {
+    $attributes['class'] = 'express-checkout-link ' . $attributes['class'];
+  }
+  else {
+    $attributes['class'] = 'express-checkout-link';
+  }
+
+  return l($text, $path, array(
+    'absolute' => TRUE,
+    'attributes' => $attributes,
+    'query' => $options,
+  ));
+}
+
+function commerce_express_checkout_generate_checkout_button_code($product_id) {
+  return '<p>This is how it will look like, copy the code below and paste it anywhere on your site or on any external site you want to put a buy link on:<p>'.commerce_express_checkout_generate_checkout_button($product_id).'</p></p>'.'&ltspan style="display: inline-block; padding: 10px; border: 1px solid #CCCCCC; border-radius: 20px; background-color: #EEEEEE;"&gt&lta href="'.url("commerce-express-checkout/".$product_id.'/'.drupal_hmac_base64($product_id, drupal_get_private_key().drupal_get_hash_salt()), array('absolute' => TRUE)).'" style="text-decoration: none; font-weight: bold; color: #666666"&gt'.t('Express Checkout').'&lt/a&gt&lt/span&gt';
+}
+
+function commerce_express_checkout_generate_link($product_id, $options = array()) {
+  $token = drupal_hmac_base64($product_id, drupal_get_private_key() . drupal_get_hash_salt());
+  $path = "commerce-express-checkout/$product_id/$token";
+
+  $options += array('absolute' => TRUE);
+
+  return url($path, $options);
+}
